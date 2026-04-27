@@ -24,22 +24,18 @@ class JobContext:
         device: str,
         job_id: int,
         output_dir: str,
-        per_job_dir: bool,
         label: str,
         msg_queue: Queue,
     ):
         self.device = device
         self.job_id = job_id
         self._output_dir = Path(output_dir)
-        self._per_job_dir = per_job_dir
         self._job_dir: Optional[Path] = None
         self._label = label
         self._msg_queue = msg_queue
 
     @property
     def job_dir(self) -> Path:
-        if not self._per_job_dir:
-            raise RuntimeError("ctx.job_dir requires per_job_dir=True")
         if self._job_dir is None:
             self._job_dir = self._output_dir / "jobs" / str(self.job_id)
             self._job_dir.mkdir(parents=True, exist_ok=True)
@@ -56,7 +52,6 @@ def _worker_fn(
     device: str,
     worker_idx: int,
     output_dir: str,
-    per_job_dir: bool,
 ) -> None:
     if device.startswith("cuda"):
         gpu_idx = device.split(":")[1]
@@ -71,12 +66,12 @@ def _worker_fn(
             break
 
         job_id, job_params, job_num, total = item
-        ctx = JobContext(device, job_id, output_dir, per_job_dir, label, msg_queue)
+        ctx = JobContext(device, job_id, output_dir, label, msg_queue)
 
-        msg_queue.put((MsgKind.PROGRESS, label, "start", job_num, total))
+        msg_queue.put((MsgKind.PROGRESS, label, "start", job_num, total, job_id))
         try:
             result = fn(ctx, **job_params)
             msg_queue.put((MsgKind.RESULT, job_id, job_params, result))
         except Exception:
             msg_queue.put((MsgKind.FAILED, job_id, job_params, traceback.format_exc()))
-        msg_queue.put((MsgKind.PROGRESS, label, "done", job_num, total))
+        msg_queue.put((MsgKind.PROGRESS, label, "done", job_num, total, job_id))

@@ -27,7 +27,7 @@ def train(ctx, seed, max_depth, n_estimators):
 if __name__ == "__main__":
     experiment(
         fn=train,
-        params={
+        sweep={
             "seed": [1, 2, 3],
             "max_depth": [3, 5, 7],
             "n_estimators": [100, 300],

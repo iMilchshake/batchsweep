@@ -5,7 +5,7 @@ import time
 from itertools import product
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 
@@ -90,37 +90,68 @@ def _append_failure(path: Path, job_id: int, job_params: dict, tb: str) -> None:
         f.write(tb + "\n")
 
 
+def _fmt_eta(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"~{s}s"
+    elif s < 3600:
+        return f"~{s // 60}m {s % 60}s"
+    else:
+        return f"~{s // 3600}h {(s % 3600) // 60}m"
+
+
 def experiment(
     fn: Callable,
-    params: dict[str, list],
     output_dir: Union[str, Path],
+    sweep: Optional[dict[str, list]] = None,
+    jobs: Optional[list[dict[str, Any]]] = None,
     gpus: Optional[list[int]] = None,
     workers_per_gpu: int = 1,
-    per_job_dir: bool = False,
+    on_job_done: Optional[Callable[[int, dict, dict], None]] = None,
+    on_job_fail: Optional[Callable[[int, dict, str], None]] = None,
+    on_complete: Optional[Callable[[], None]] = None,
 ) -> None:
+    if (sweep is None) == (jobs is None):
+        raise ValueError("Exactly one of `sweep` or `jobs` must be provided.")
+
+    if sweep is not None:
+        param_keys = list(sweep.keys())
+        all_job_params = [
+            dict(zip(param_keys, combo)) for combo in product(*sweep.values())
+        ]
+    else:
+        if not jobs:
+            raise ValueError("`jobs` must not be empty.")
+        param_keys = list(jobs[0].keys())
+        expected = set(param_keys)
+        for i, j in enumerate(jobs[1:], 1):
+            if set(j.keys()) != expected:
+                raise ValueError(
+                    f"`jobs[{i}]` has keys {sorted(j.keys())}, expected {sorted(expected)}."
+                )
+        all_job_params = jobs
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     _setup_logger(output_dir / "experiment.log")
     results_path = output_dir / "results.csv"
     failures_path = output_dir / "failures.log"
-    param_keys = list(params.keys())
 
     done, next_id, existing_metrics = _load_existing(results_path, param_keys)
 
-    all_combos = list(product(*params.values()))
-    jobs = []
-    for combo in all_combos:
-        if tuple(str(v) for v in combo) not in done:
-            jobs.append((next_id, dict(zip(param_keys, combo))))
+    pending = []
+    for job_params in all_job_params:
+        if tuple(str(job_params[k]) for k in param_keys) not in done:
+            pending.append((next_id, job_params))
             next_id += 1
 
-    if not jobs:
+    if not pending:
         logger.info("All jobs already completed.")
         return
 
-    total = len(jobs)
-    skipped = len(all_combos) - total
+    total = len(pending)
+    skipped = len(all_job_params) - total
     logger.info(
         f"Running {total} jobs" + (f" ({skipped} skipped)." if skipped else ".")
     )
@@ -140,7 +171,7 @@ def experiment(
     job_q = mp.Queue()
     msg_q = mp.Queue()
 
-    for i, (job_id, job_params) in enumerate(jobs):
+    for i, (job_id, job_params) in enumerate(pending):
         job_q.put((job_id, job_params, i + 1, total))
     for _ in slots:
         job_q.put(None)
@@ -148,7 +179,7 @@ def experiment(
     procs = [
         mp.Process(
             target=_worker_fn,
-            args=(fn, job_q, msg_q, g, w, str(output_dir), per_job_dir),
+            args=(fn, job_q, msg_q, g, w, str(output_dir)),
         )
         for g, w in slots
     ]
@@ -168,6 +199,7 @@ def experiment(
     metric_keys = existing_metrics
     buffered_failed: list[tuple[int, dict]] = []
     done_count = 0
+    start_time = time.time()
 
     while done_count < total:
         try:
@@ -183,9 +215,17 @@ def experiment(
             logger.info(msg[1])
 
         elif kind == MsgKind.PROGRESS:
-            _, label, event, job_num, job_total = msg
-            verb = "Start" if event == "start" else "Finished"
-            logger.info(f"{label} {verb} job {job_num}/{job_total}")
+            _, label, event, job_num, job_total, job_id = msg
+            if event == "start":
+                logger.info(f"{label} Start job {job_num}/{job_total} (idx={job_id})")
+            else:
+                elapsed = time.time() - start_time
+                avg_per_job = elapsed / done_count if done_count else elapsed
+                remaining = (total - done_count) * avg_per_job / len(slots)
+                eta = _fmt_eta(remaining)
+                logger.info(
+                    f"{label} Finished job {job_num}/{job_total} (idx={job_id}) [ETA {eta}]"
+                )
 
         elif kind == MsgKind.NO_MORE_JOBS:
             logger.info(f"{msg[1]} No more jobs")
@@ -193,6 +233,12 @@ def experiment(
         elif kind == MsgKind.RESULT:
             _, job_id, job_params, result = msg
             if metric_keys is None:
+                overlap = set(result.keys()) & (set(param_keys) | {"job_id", "status"})
+                if overlap:
+                    raise ValueError(
+                        f"Metric keys {sorted(overlap)} conflict with reserved/parameter keys. "
+                        f"Rename these in your return dict."
+                    )
                 metric_keys = list(result.keys())
                 _write_header(results_path, param_keys, metric_keys)
                 for fid, fparams in buffered_failed:
@@ -200,9 +246,13 @@ def experiment(
                         results_path, fid, "failed", fparams, param_keys, metric_keys
                     )
                 buffered_failed.clear()
-            elif list(result.keys()) != metric_keys:
+            elif set(result.keys()) != set(metric_keys):
+                missing = set(metric_keys) - set(result.keys())
+                extra = set(result.keys()) - set(metric_keys)
                 raise ValueError(
-                    f"Job {job_id} returned keys {list(result.keys())}, expected {metric_keys}"
+                    f"Job {job_id} metric key mismatch. "
+                    f"Missing: {sorted(missing) or 'none'}, "
+                    f"Extra: {sorted(extra) or 'none'}"
                 )
             _append_row(
                 results_path,
@@ -214,6 +264,8 @@ def experiment(
                 result,
             )
             done_count += 1
+            if on_job_done is not None:
+                on_job_done(job_id, job_params, result)
 
         elif kind == MsgKind.FAILED:
             _, job_id, job_params, tb = msg
@@ -225,6 +277,8 @@ def experiment(
             else:
                 buffered_failed.append((job_id, job_params))
             done_count += 1
+            if on_job_fail is not None:
+                on_job_fail(job_id, job_params, tb)
 
     signal.signal(signal.SIGINT, orig_sigint)
 
@@ -232,6 +286,8 @@ def experiment(
         time.sleep(2)  # grace period so workers can finish writing before SIGTERM
         for p in procs:
             p.terminate()
+    elif on_complete is not None:
+        on_complete()
 
     for p in procs:
         p.join()
