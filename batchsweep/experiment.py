@@ -221,7 +221,7 @@ def experiment(
             else:
                 elapsed = time.time() - start_time
                 avg_per_job = elapsed / done_count if done_count else elapsed
-                remaining = (total - done_count) * avg_per_job / len(slots)
+                remaining = (total - done_count) * avg_per_job
                 eta = _fmt_eta(remaining)
                 logger.info(
                     f"{label} Finished job {job_num}/{job_total} (idx={job_id}) [ETA {eta}]"
