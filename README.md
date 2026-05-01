@@ -48,7 +48,6 @@ experiment(
 I might fix these in the future:
 
 - Info about cuda devices via `torch`, assumes that projects run with torch. I might replace this with a more lightweight approach.
-- No automatic dataset sharing across workers, each job needs to handle everything from dataloading to metric calculation, `batchsweep` only performs the orchestration. If dataloading requires costly pre-processing the best way most likely is to temporarily cache it. I might add some automatic handling for this (via joblib?).
 - Workers are persistent so any global state changes carry over to following jobs on the same worker, users should make sure to initialize a clean local state. However, i might add a parameter that launches completely new processes instead of re-using old ones.
 
 ## API Reference
@@ -57,7 +56,7 @@ I might fix these in the future:
 
 ```python
 def experiment(
-    fn: Callable[[JobContext, ...], dict[str, float | int | str]],   # job function, return metrics dict
+    fn: Callable[[JobContext, ...], dict[str, float | int | str]],     # job function, return metrics dict
     sweep: Optional[dict[str, list]] = None,                         # cartesian grid (mutually exclusive with `jobs`)
     jobs: Optional[list[dict[str, Any]]] = None,                     # explicit job list (mutually exclusive with `sweep`)
     output_dir: str | Path,                                          # run directory, created if missing
@@ -66,6 +65,8 @@ def experiment(
     on_job_done: Optional[Callable[[int, dict, dict], None]] = None, # called after each finished job, (job_id, params, metrics) -> None
     on_job_fail: Optional[Callable[[int, dict, str], None]] = None,  # called after each failed job, (job_id, params, traceback_str) -> None
     on_complete: Optional[Callable[[], None]] = None,                # called after all jobs finish, () -> None
+    shared_data: Optional[dict[str, np.ndarray]] = None,             # read-only numpy arrays shared across all workers
+    keep_shared_data: bool = False,                                  # choose if shared_data are kept after the run for reproducibility
 ) -> None
 ```
 
@@ -73,10 +74,11 @@ def experiment(
 
 ```python
 class JobContext:
-    device: str               # e.g. "cuda:0" or "cpu"
-    job_id: int               # unique ID
-    job_dir: Path             # optional per-job output directory, is created lazily
-    def log(msg: str) -> None # send log message to the main process logger
+    device: str                      # e.g. "cuda:0" or "cpu"
+    job_id: int                      # unique ID
+    job_dir: Path                    # optional per-job output directory, is created lazily
+    shared_data: SharedData | None   # dict of shared numpy arrays, actual data is loaded lazily
+    def log(msg: str) -> None         # send log message to the main process logger
 ```
 
 ### Output structure
@@ -86,6 +88,8 @@ output_dir/
 ├── results.csv    # job_id, status, <params...>, <metrics...>
 ├── experiment.log # timestamped log of all activity
 ├── failures.log   # tracebacks of failed jobs
+├── shared/        # only preserved if keep_shared_data=True
+│   └── <key>.npy
 └── jobs/          # created on first ctx.job_dir access
     ├── 0/
     ├── 1/
@@ -102,10 +106,9 @@ cd batchsweep
 pip install -e ".[dev]"
 ```
 
-2. Generate example dataset, then run the test sweep script:
+2. Run the example sweep:
 
 ```bash
 cd examples
-python generate_dataset.py
 python xgb_sweep.py
 ```

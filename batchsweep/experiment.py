@@ -1,5 +1,6 @@
 import csv
 import logging
+import shutil
 import signal
 import time
 from itertools import product
@@ -7,6 +8,7 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
+import numpy as np
 import torch
 
 from .worker import MsgKind, _worker_fn, logger
@@ -110,6 +112,8 @@ def experiment(
     on_job_done: Optional[Callable[[int, dict, dict], None]] = None,
     on_job_fail: Optional[Callable[[int, dict, str], None]] = None,
     on_complete: Optional[Callable[[], None]] = None,
+    shared_data: Optional[dict[str, np.ndarray]] = None,
+    keep_shared_data: bool = False,
 ) -> None:
     if (sweep is None) == (jobs is None):
         raise ValueError("Exactly one of `sweep` or `jobs` must be provided.")
@@ -167,6 +171,14 @@ def experiment(
         else [("cpu", w) for w in range(workers_per_gpu)]
     )
 
+    shared_dir: Optional[str] = None
+    if shared_data is not None:
+        shared_dir_path = output_dir / "shared"
+        shared_dir_path.mkdir(parents=True, exist_ok=True)
+        for key, arr in shared_data.items():
+            np.save(shared_dir_path / f"{key}.npy", arr)
+        shared_dir = str(shared_dir_path)
+
     mp = get_context("spawn")
     job_q = mp.Queue()
     msg_q = mp.Queue()
@@ -179,7 +191,7 @@ def experiment(
     procs = [
         mp.Process(
             target=_worker_fn,
-            args=(fn, job_q, msg_q, g, w, str(output_dir)),
+            args=(fn, job_q, msg_q, g, w, str(output_dir), shared_dir),
         )
         for g, w in slots
     ]
@@ -291,3 +303,6 @@ def experiment(
 
     for p in procs:
         p.join()
+
+    if shared_dir is not None and not keep_shared_data:
+        shutil.rmtree(shared_dir)
