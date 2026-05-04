@@ -32,6 +32,12 @@ def _setup_logger(log_file: Path) -> None:
     logger.addHandler(file_handler)
 
 
+def _param_str(v) -> str:
+    # csv.writer converts None→"" but str(None)="None", breaking resume matching.
+    # Newline escaping keeps CSV rows single-line for readability.
+    return ("" if v is None else str(v)).replace("\r\n", "\\r\\n").replace("\r", "\\r").replace("\n", "\\n")
+
+
 def _load_existing(
     results_path: Path, param_keys: list[str]
 ) -> tuple[set, set, int, Optional[list[str]]]:
@@ -58,12 +64,12 @@ def _load_existing(
         k for k in fieldnames if k not in {"job_id", "status"} and k not in param_set
     ]
     succeeded = {
-        tuple(str(row[k]) for k in param_keys)
+        tuple(_param_str(row[k]) for k in param_keys)
         for row in rows
         if row["status"] == "success"
     }
     failed = {
-        tuple(str(row[k]) for k in param_keys)
+        tuple(_param_str(row[k]) for k in param_keys)
         for row in rows
         if row["status"] == "failed"
     }
@@ -87,7 +93,7 @@ def _append_row(
 ) -> None:
     with open(path, "a", newline="") as f:
         row = [job_id, status]
-        row += [job_params[k] for k in param_keys]
+        row += [_param_str(job_params[k]) for k in param_keys]
         row += [metrics.get(k, "") if metrics else "" for k in metric_keys]
         csv.writer(f).writerow(row)
 
@@ -158,10 +164,18 @@ def experiment(
     if succeeded or failed_prev:
         logger.info(f"Loaded {len(succeeded)} succeeded and {len(failed_prev)} failed results from previous run.")
 
+    current_keys = {tuple(_param_str(job_params[k]) for k in param_keys) for job_params in all_job_params}
+    orphaned = (succeeded | failed_prev) - current_keys
+    if orphaned:
+        logger.warning(
+            f"{len(orphaned)} results in CSV don't match any job in the current queue — "
+            "job parameters may have changed between runs."
+        )
+
     pending = []
     retried = 0
     for job_params in all_job_params:
-        key = tuple(str(job_params[k]) for k in param_keys)
+        key = tuple(_param_str(job_params[k]) for k in param_keys)
         if key not in succeeded:
             pending.append((next_id, job_params))
             next_id += 1
