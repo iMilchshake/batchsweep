@@ -34,9 +34,9 @@ def _setup_logger(log_file: Path) -> None:
 
 def _load_existing(
     results_path: Path, param_keys: list[str]
-) -> tuple[set, int, Optional[list[str]]]:
+) -> tuple[set, set, int, Optional[list[str]]]:
     if not results_path.exists():
-        return set(), 0, None
+        return set(), set(), 0, None
 
     with open(results_path, newline="") as f:
         reader = csv.DictReader(f)
@@ -44,7 +44,7 @@ def _load_existing(
         fieldnames = list(reader.fieldnames or [])
 
     if not rows:
-        return set(), 0, None
+        return set(), set(), 0, None
 
     param_set = set(param_keys)
     csv_params = {k for k in fieldnames if k in param_set}
@@ -57,9 +57,18 @@ def _load_existing(
     metric_keys = [
         k for k in fieldnames if k not in {"job_id", "status"} and k not in param_set
     ]
-    done = {tuple(str(row[k]) for k in param_keys) for row in rows}
+    succeeded = {
+        tuple(str(row[k]) for k in param_keys)
+        for row in rows
+        if row["status"] == "success"
+    }
+    failed = {
+        tuple(str(row[k]) for k in param_keys)
+        for row in rows
+        if row["status"] == "failed"
+    }
     next_id = max(int(row["job_id"]) for row in rows) + 1
-    return done, next_id, metric_keys
+    return succeeded, failed, next_id, metric_keys
 
 
 def _write_header(path: Path, param_keys: list[str], metric_keys: list[str]) -> None:
@@ -142,23 +151,32 @@ def experiment(
     results_path = output_dir / "results.csv"
     failures_path = output_dir / "failures.log"
 
-    done, next_id, existing_metrics = _load_existing(results_path, param_keys)
+    succeeded, failed_prev, next_id, existing_metrics = _load_existing(
+        results_path, param_keys
+    )
+
+    if succeeded or failed_prev:
+        logger.info(f"Loaded {len(succeeded)} succeeded and {len(failed_prev)} failed results from previous run.")
 
     pending = []
+    retried = 0
     for job_params in all_job_params:
-        if tuple(str(job_params[k]) for k in param_keys) not in done:
+        key = tuple(str(job_params[k]) for k in param_keys)
+        if key not in succeeded:
             pending.append((next_id, job_params))
             next_id += 1
+            if key in failed_prev:
+                retried += 1
+
+    total = len(pending)
+    skipped = len(all_job_params) - total
+    new_jobs = total - retried
 
     if not pending:
         logger.info("All jobs already completed.")
         return
 
-    total = len(pending)
-    skipped = len(all_job_params) - total
-    logger.info(
-        f"Running {total} jobs" + (f" ({skipped} skipped)." if skipped else ".")
-    )
+    logger.info(f"Running {total}/{len(all_job_params)} jobs" + (f" (skipping {skipped}, retrying {retried}, new {new_jobs})" if skipped or retried else ""))
 
     if gpus is None:
         gpus = (
@@ -211,6 +229,8 @@ def experiment(
     metric_keys = existing_metrics
     buffered_failed: list[tuple[int, dict]] = []
     done_count = 0
+    success_count = 0
+    fail_count = 0
     start_time = time.time()
 
     while done_count < total:
@@ -276,6 +296,7 @@ def experiment(
                 result,
             )
             done_count += 1
+            success_count += 1
             if on_job_done is not None:
                 on_job_done(job_id, job_params, result)
 
@@ -289,6 +310,7 @@ def experiment(
             else:
                 buffered_failed.append((job_id, job_params))
             done_count += 1
+            fail_count += 1
             if on_job_fail is not None:
                 on_job_fail(job_id, job_params, tb)
 
@@ -298,8 +320,10 @@ def experiment(
         time.sleep(2)  # grace period so workers can finish writing before SIGTERM
         for p in procs:
             p.terminate()
-    elif on_complete is not None:
-        on_complete()
+    else:
+        logger.info(f"Done. {success_count}/{total} jobs succeeded" + (f", {fail_count} failed." if fail_count else "."))
+        if on_complete is not None:
+            on_complete()
 
     for p in procs:
         p.join()
